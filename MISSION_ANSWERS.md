@@ -709,7 +709,114 @@ Docker tự restart container (`restarts=1`). Instance mới có **ID khác** (`
 
 ## Part 6: Final Project — output `check_production_ready.py`
 
-_(CP5: chưa làm. Dán phần "📋 Checklist Deliverable" ở đây.)_
+Chạy bản **đầy đủ** (có Docker) trong `06-lab-complete/`, trên WSL2 (`os.name == "posix"`):
+
+```text
+$ python check_production_ready.py
+...
+✅ 1. Dockerfile (multi-stage, < 500 MB)
+     ✅ Docker: build image thành công — 39s
+     ✅ Docker: image < 500 MB — 63 MB
+     ✅ Docker: container chạy được, GET /health → 200
+...
+✅ 7. Rate limiting
+     ✅ Khi chạy: vượt giới hạn → 429 — 429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)
+     ✅ Khi chạy: state nằm trong Redis — restart agent vẫn bị 429
+✅ 8. Cost guard
+     ✅ Khi chạy: hết budget → 402 — 402 ở request thứ 1
+...
+✅ 10. Structured logging
+     ✅ Khi chạy: mọi dòng log của app là JSON hợp lệ — 15 dòng JSON
+✅ 11. Graceful shutdown
+     ✅ Khi chạy: SIGTERM lúc đang có request → request vẫn 200, process tự thoát — exit code 0
+     ✅ Docker: `docker stop` tắt êm (exit code 0, < 10s) — exit code 0, 0.8s
+...
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+### Cách mình làm từng tiêu chí
+
+| # | Tiêu chí | File | Cách làm và lý do |
+|---|----------|------|--------------------|
+| 1 | Dockerfile | `Dockerfile` | 2 stage. `builder` cài dependency vào venv `/opt/venv`. `runtime` là `python:3.11-slim` sạch, chỉ copy venv + `app/` + `utils/`, user `app` (non-root), `HEALTHCHECK` gọi `/health` theo `$PORT`. `CMD ["sh","-c","exec uvicorn ... --port ${PORT:-8000} ..."]`: `exec` để uvicorn là PID 1 và nhận SIGTERM. Đã có wheel sẵn cho mọi package nên không cần gcc. Image 63 MB (`docker image inspect`) / 286 MB (`docker images`). |
+| 2 | Compose | `docker-compose.yml` | `agent` build từ Dockerfile + `redis:7-alpine` có healthcheck. `depends_on: condition: service_healthy`. `REDIS_URL=redis://redis:6379/0` ghi đè giá trị trong `.env`. `env_file` với `required: false` nên không có `.env` vẫn chạy. |
+| 3 | `.dockerignore` | `.dockerignore` | Loại `.env*` (giữ `.env.example`), `__pycache__`, `venv`, `.git`, tài liệu, script chấm và `benchmark-observability/`. |
+| 4 | `/health` | `app/main.py` | Luôn 200, **không** gọi Redis. Redis chết thì restart agent cũng không sửa được, nên không được làm fail liveness. |
+| 5 | `/ready` | `app/main.py`, `app/redis_client.py` | `PING` Redis với `socket_connect_timeout=1`. Lỗi thì trả **503** `{"ready":false,"redis":"unreachable"}`. Client Redis tạo bằng `redis.from_url()`, lệnh này chưa kết nối ngay, nên app vẫn khởi động được khi chưa có Redis. |
+| 6 | API key | `app/auth.py` | `APIKeyHeader("X-API-Key", auto_error=False)` + `secrets.compare_digest` (chống timing attack). Thiếu hoặc sai key đều **401** (khác bản Part 4 trả 403 khi sai key). Chưa đặt `AGENT_API_KEY` thì từ chối mọi request. Khi `ENVIRONMENT=production` mà thiếu key thì app không khởi động. |
+| 7 | Rate limit | `app/rate_limiter.py` | Sliding window log bằng sorted set trong Redis, key `ratelimit:<sha256(api_key)[:16]>` (không lưu key thô). `ZREMRANGEBYSCORE → ZCARD → ZADD → PEXPIRE` nằm trong **một Lua script** nên atomic giữa 2 worker và nhiều instance. Dùng `TIME` của Redis để mọi instance chung một đồng hồ. Vượt giới hạn thì **429** + `Retry-After`. |
+| 8 | Cost guard | `app/cost_guard.py` | Chi phí theo token (giá gpt-4o-mini), cộng dồn theo **ngày và tháng** (UTC) trong Redis. Trước khi gọi LLM, Lua script kiểm tra `đã tiêu + ước lượng > budget` và **giữ chỗ** atomic (bài học từ Exercise 4.4: tách GET → INCR sẽ vượt budget khi có tải đồng thời). Sau khi gọi, cộng hoặc trừ phần chênh với chi phí thật. LLM lỗi thì trả lại phần giữ chỗ. Vượt budget thì **402**. |
+| 9 | Config | `app/config.py`, `.env.example` | Mọi giá trị đọc từ env (`PORT`, `ENVIRONMENT`, `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD`, `LOG_LEVEL`, ...). Ép kiểu và báo lỗi rõ ràng (vd `RATE_LIMIT_PER_MINUTE phải là số nguyên`). Secret không có giá trị mặc định. |
+| 10 | Log JSON | `app/logging_config.py` | `JsonFormatter` dựng dict rồi `json.dumps` **một lần**, nên mỗi dòng là một JSON object hợp lệ (tránh lỗi đã thấy ở Part 1). Logger `agent` có handler riêng và `propagate=False`, không bị `basicConfig` hay root logger chen vào. Middleware ghi `request_id`, `method`, `path`, `status`, `ms`. **Không** log API key hay nội dung câu hỏi (chỉ log `question_chars`). |
+| 11 | Graceful shutdown | `app/main.py` (lifespan) | **Không** tự đăng ký signal handler (Part 5 cho thấy uvicorn ghi đè nó). Uvicorn nhận SIGTERM, ngừng nhận kết nối mới và chờ request đang chạy xong. Sau đó phần shutdown của `lifespan` ghi log và đóng Redis. `--timeout-graceful-shutdown 8` nhỏ hơn 10s mặc định của `docker stop`. |
+| 12 | Deploy config | `railway.toml`, `render.yaml` | Railway: `builder = "DOCKERFILE"`, `healthcheckPath = "/health"`. Render: `type: web`, `runtime: docker`, `healthCheckPath: /health`, `AGENT_API_KEY` dùng `generateValue: true`, Redis khai báo là service `keyvalue` và nối vào `REDIS_URL` qua `fromService`. |
+
+Ngoài ra, `/ask` khai báo là `def` (không phải `async def`) nên FastAPI chạy nó trong threadpool. Lời gọi LLM và Redis blocking không chặn event loop (tránh lỗi đã đo ở Exercise 5.1).
+
+### Kiểm tra thêm bằng `docker compose` (ngoài script chấm)
+
+`docker compose -p k5-day14-agent up -d --build` với `.env` tạm (key ngẫu nhiên, `RATE_LIMIT_PER_MINUTE=10`), xoá `.env` sau khi test:
+
+```text
+$ GET /health                → 200 {"status":"ok","version":"1.0.0","environment":"staging","uptime_seconds":0.7}
+$ GET /ready                 → 200 {"ready":true,"redis":"ok"}
+$ POST /ask (không có key)   → 401 {"detail":"Missing or invalid API key. Send header: X-API-Key: <key>"}
+$ POST /ask (sai key)        → 401 (như trên)
+$ POST /ask (đúng key)       → 200 x-ratelimit-limit: 10, x-ratelimit-remaining: 9
+  {"question":"What is deployment?","answer":"Deployment là quá trình đưa code từ máy bạn lên server để người khác dùng được.","usage":{"input_tokens":5,"output_tokens":20,"cost_usd":1.275e-05,"requests_remaining_this_minute":9}}
+```
+
+**Xử lý lỗi: input sai trả mã lỗi rõ ràng, không lộ stack trace:**
+
+```text
+question rỗng          → 422 {"detail":[{"type":"string_too_short","loc":["body","question"],"msg":"String should have at least 1 character",...}]}
+body không phải JSON   → 422 {"detail":[{"type":"json_invalid","loc":["body",0],"msg":"JSON decode error",...}]}
+thiếu field question   → 422 {"detail":[{"type":"missing","loc":["body","question"],"msg":"Field required",...}]}
+```
+
+Lỗi không lường trước (test bằng `TestClient`, cho `count_tokens` ném `ZeroDivisionError("secret internal detail")`):
+
+```text
+status: 500
+body: {"error":"internal_error","request_id":"253db989b2fc4cff"}
+stack trace / chi tiết lỗi trong response? False
+log: {"ts": "...", "lvl": "ERROR", "logger": "agent", "event": "unhandled_error", "request_id": "253db989b2fc4cff", "method": "POST", "path": "/ask", "exc_type": "ZeroDivisionError", "exc": "Traceback (most recent call last):\n ..."}
+```
+
+→ Client chỉ nhận thông báo chung kèm `request_id`. Stack trace nằm trong **một** dòng log JSON có cùng `request_id`, nên vẫn tra được lỗi.
+
+**Rate limit** (limit 10, đã dùng 1 request; 3 request bị 422 không bị tính): `200 × 9` rồi `429 × 3`, kèm `retry-after: 59`, `x-ratelimit-remaining: 0`.
+
+**`/health` khi đang có 5 `/ask` chạy song song:** `200 sau 0.008s`. Event loop không bị chặn.
+
+**Redis chết** (`docker compose stop redis`): `/health → 200`, `/ready → 503 {"ready":false,"redis":"unreachable"}`, `/ask → 503 {"detail":"Service temporarily unavailable"}`. Bật lại Redis thì `/ready → 200`. *Ghi chú:* request `/ask` đầu tiên lúc Redis vừa chết mất 7.8s mới trả 503, dù `socket_connect_timeout=1`. Có thể do tên `redis` không còn trong DNS của Docker, phải hỏi ra DNS ngoài, mà timeout kết nối không bao gồm thời gian tra DNS.
+
+**Log JSON mẫu** (trích `docker compose logs agent`). Không dòng nào chứa API key (`grep` key → 0 dòng):
+
+```json
+{"ts": "2026-11-26T09:11:01.316+00:00", "lvl": "INFO", "logger": "agent", "event": "request", "request_id": "23438b0b70114307", "method": "POST", "path": "/ask", "status": 429, "ms": 7.9}
+{"ts": "2026-11-26T09:11:17.539+00:00", "lvl": "ERROR", "logger": "agent", "event": "dependency_error", "dependency": "redis", "path": "/ask"}
+{"ts": "2026-11-26T09:11:17.540+00:00", "lvl": "INFO", "logger": "agent", "event": "request", "request_id": "f99fc86e37b14f4f", "method": "POST", "path": "/ask", "status": 503, "ms": 7850.2}
+```
+
+**`docker compose stop agent`** → exit code 0 sau 0.7s.
 
 ## AI log
 
@@ -721,3 +828,4 @@ _(CP5: chưa làm. Dán phần "📋 Checklist Deliverable" ở đây.)_
 | 4 | CP2: build image, đo kích thước, chạy Compose stack; xử lý lỗi Docker Hub `429 Too Many Requests` | Gợi ý pull base image qua `mirror.gcr.io` rồi `docker tag` lại tên gốc (không sửa Dockerfile); script build, đo size, test Compose | Số MB lấy trực tiếp từ `docker images` trên máy mình (1.67GB vs 240MB); tự kiểm cache bằng cách build lại thấy `CACHED`; tự xác nhận agent không mở cổng ra host (connection refused) và request đi qua nginx (header `Server: nginx`) |
 | 5 | CP3: chạy Part 4 develop/production, giải thích JWT và rate limit, viết `check_budget` với Redis | Script curl test 401/403/200/429, decode payload JWT, script dùng `CostGuard` với budget nhỏ để thấy 402/503; gợi ý dùng Lua script cho atomic check+increment | Tự chạy vòng lặp 20 request thấy 429 từ request thứ 11; tự test `check_budget` với Redis thật: tuần tự, sang tháng mới, và 50 thread đồng thời (Lua dừng đúng $10.00, bản GET→INCR của CODE_LAB lố $23.50) |
 | 6 | CP4: test health/ready, graceful shutdown, chạy stack 3 instance + test stateless; xử lý WSL timeout do thiếu RAM | Script đo `/health` khi có request đang chạy, test SIGTERM giữa request, thí nghiệm 2 instance không Redis, thí nghiệm kill/crash instance; chẩn đoán RAM host chỉ còn ~700MB → `wsl --shutdown`, tắt bớt app | Tự thấy `/health` chậm 2.7s và 3 request xếp hàng 9.2s (event loop bị chặn); in-flight request vẫn 200 sau SIGTERM, exit 0; history bị chia đôi khi không có Redis; `test_stateless.py` 5 câu qua 3 instance vẫn đủ 10 message; kill 1 instance → request vẫn 200 nhưng có 1 request chờ 60s (proxy_connect_timeout mặc định) |
+| 7 | CP5: hoàn thành các TODO của `06-lab-complete/` theo hợp đồng của `check_production_ready.py` | Claude đọc script chấm, viết `config.py`, `logging_config.py`, `auth.py`, `redis_client.py`, `rate_limiter.py` (Lua sliding window), `cost_guard.py` (Lua giữ chỗ budget ngày + tháng), `main.py`, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml` | Chạy `--static-only` (28/28) → `--skip-docker` (39/39) → bản đầy đủ **PASS 12/12, 43/43**; tự test thêm bằng `docker compose`: 401/200/429/422, Redis chết → `/ready` 503 còn `/health` 200, log không chứa API key, `docker stop` exit 0. **Cần tự đọc lại và giải thích được từng file trong `app/`** (Lab Coach có thể hỏi) |
