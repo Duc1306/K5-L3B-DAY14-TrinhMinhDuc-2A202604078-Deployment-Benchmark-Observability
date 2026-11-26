@@ -267,7 +267,58 @@ Dọn stack: `docker compose -p k5-day14-docker down -v`.
 
 ## Part 3: Cloud Deployment
 
-_(CP6: chưa làm)_
+> Lớp K5 deploy luôn **agent Part 6** (`06-lab-complete/`), không deploy app mẫu `03-cloud-deployment/` (README lưu ý số 8). Nền tảng chính: **Render**. Chi tiết trong [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### Exercise 3.2: Render deployment (nền tảng chính)
+
+- **URL:** https://day14-agent-opr7.onrender.com
+- **Cách deploy:** push repo lên GitHub → Render Dashboard → **New → Blueprint** → chọn repo → **Blueprint Path** = `06-lab-complete/render.yaml` → Apply. Render tạo 2 resource: web service `day14-agent` (Docker) và Key Value `day14-redis`. `REDIS_URL` được nối tự động qua `fromService`, còn `AGENT_API_KEY` do Render sinh (`generateValue: true`).
+- **Screenshots:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png)
+
+Tự kiểm theo CP6:
+
+```text
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"     → 200   {"status":"ok","version":"1.0.0","environment":"production","uptime_seconds":138.3}
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"      → 200   {"ready":true,"redis":"ok"}
+$ curl ... -X POST "$BASE/ask" (không có key)                 → 401
+$ curl ... -X POST "$BASE/ask" -H "X-API-Key: $AGENT_API_KEY"  → 200
+
+Kết quả 4 lệnh (screenshots/test.png): 200, 200, 401, 200
+
+$ python check_production_ready.py --public-url https://day14-agent-opr7.onrender.com
+     ✅ Public URL: GET https://day14-agent-opr7.onrender.com/health → 200
+```
+
+`/ready` trả `redis: ok` → agent trên cloud nói chuyện được với Redis của Render. `"environment":"production"` → biến env của platform được áp dụng (và `/docs` trả 404 vì app ẩn docs khi production).
+
+### Exercise 3.1: Railway — so sánh `railway.toml` với `render.yaml`
+
+Mình không deploy thêm Railway mà so sánh hai file cấu hình (cả bản mẫu trong `03-cloud-deployment/` lẫn bản mình viết trong `06-lab-complete/`):
+
+| Khía cạnh | `railway.toml` | `render.yaml` | Vì sao khác |
+|-----------|----------------|---------------|-------------|
+| Định dạng / phạm vi | TOML, cấu hình **build + deploy của một service** | YAML Blueprint, mô tả **cả hạ tầng**: nhiều service (web + Key Value), env var, cách nối giữa chúng | Railway coi file là "config-as-code" cho service; Render coi Blueprint là Infrastructure-as-Code cho cả project |
+| Build | `builder = "DOCKERFILE"` (hoặc `NIXPACKS` / `RAILPACK` tự đoán, như bản mẫu) | `runtime: docker` + `dockerfilePath` / `dockerContext`, hoặc `runtime: python` + `buildCommand` (bản mẫu) | Hai nền tảng có builder tự động khác nhau |
+| Lệnh chạy | `startCommand` (bản mẫu: `uvicorn app:app --port $PORT`); bản của mình bỏ trống → dùng `CMD` của Dockerfile | `startCommand` (bản mẫu); bản Docker của mình dùng `CMD` | Khi deploy bằng Docker, `CMD ... ${PORT:-8000}` là nguồn duy nhất, không lặp ở 2 chỗ |
+| Health check | `healthcheckPath = "/health"` + `healthcheckTimeout` | `healthCheckPath: /health` | Cùng ý nghĩa: deploy chỉ "thành công" khi `/health` trả 200, và platform theo dõi tiếp sau đó |
+| Restart | `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không có field, Render tự restart | Railway cho chỉnh policy, Render mặc định |
+| Env var & secret | **Không** nằm trong file: đặt bằng `railway variables set ...` hoặc dashboard | Khai báo ngay trong file: `value:` cho giá trị thường, `generateValue: true` (tự sinh secret), `sync: false` (nhập tay trên dashboard), `fromService` (lấy từ service khác) | Render cho khai báo cả *tên* biến và nguồn của secret mà không lộ giá trị → dễ tái tạo môi trường |
+| Redis | Tạo Redis trong project Railway rồi tham chiếu biến (`${{Redis.REDIS_URL}}`) trên dashboard | Khai báo `type: keyvalue` (tên cũ `redis`, như bản mẫu) trong cùng file và nối bằng `fromService ... property: connectionString` | Render gom mọi thứ vào một file |
+| Monorepo (thư mục con) | `cd 06-lab-complete && railway up` (upload thư mục hiện tại) hoặc đặt Root Directory trong settings | `rootDir: 06-lab-complete` + chọn **Blueprint Path** khi tạo Blueprint | Render build từ GitHub nên cần biết thư mục con; Railway CLI upload thẳng thư mục local |
+| Kích hoạt deploy | `railway up` từ máy, hoặc nối GitHub | Push lên GitHub → Render tự deploy (`autoDeploy`) | Render dựa trên Git, Railway có thêm luồng CLI |
+| `PORT` | Railway inject `PORT` | Render inject `PORT` (mặc định 10000) | Cả hai đều yêu cầu app nghe theo `$PORT`, nên Dockerfile dùng `${PORT:-8000}` |
+
+### Exercise 3.3: Cloud Run CI/CD (chỉ đọc, không deploy)
+
+`03-cloud-deployment/production-cloud-run/cloudbuild.yaml` mô tả pipeline 4 bước, chạy tuần tự nhờ `waitFor` (một bước fail thì các bước sau không chạy):
+1. **test**: trong `python:3.11-slim`, `pip install` rồi `pytest tests/`. Test fail thì dừng, không build.
+2. **build**: `docker build` gắn tag `gcr.io/$PROJECT_ID/ai-agent:$COMMIT_SHA` và `:latest`, dùng `--cache-from ...:latest` để tận dụng layer cache.
+3. **push**: đẩy cả 2 tag lên Container Registry.
+4. **deploy**: `gcloud run deploy ai-agent --image ...:$COMMIT_SHA` ở `asia-southeast1`, `--min-instances=1` (tránh cold start), `--max-instances=10`, 512Mi / 1 CPU, `ENVIRONMENT=production`, và secret lấy từ **Secret Manager** (`--set-secrets`).
+
+`service.yaml` là bản IaC (Knative) của cùng service: autoscale 1–10 instance, `containerConcurrency: 80`, giới hạn CPU/RAM, env và secret qua `secretKeyRef`, **liveness probe `/health`** và **startup probe `/ready`**, đúng phân biệt liveness/readiness ở Part 5.
+
+*Nhận xét:* pipeline deploy theo tag `$COMMIT_SHA`, nên mỗi bản deploy gắn với một commit và rollback được về bản trước. Còn `service.yaml` trỏ `:latest`, không biết chính xác đang chạy bản nào. Repo mẫu cũng chưa có thư mục `tests/`, nên bước 1 sẽ fail nếu chạy nguyên trạng.
 
 ## Part 4: API Security
 
@@ -829,3 +880,4 @@ log: {"ts": "...", "lvl": "ERROR", "logger": "agent", "event": "unhandled_error"
 | 5 | CP3: chạy Part 4 develop/production, giải thích JWT và rate limit, viết `check_budget` với Redis | Script curl test 401/403/200/429, decode payload JWT, script dùng `CostGuard` với budget nhỏ để thấy 402/503; gợi ý dùng Lua script cho atomic check+increment | Tự chạy vòng lặp 20 request thấy 429 từ request thứ 11; tự test `check_budget` với Redis thật: tuần tự, sang tháng mới, và 50 thread đồng thời (Lua dừng đúng $10.00, bản GET→INCR của CODE_LAB lố $23.50) |
 | 6 | CP4: test health/ready, graceful shutdown, chạy stack 3 instance + test stateless; xử lý WSL timeout do thiếu RAM | Script đo `/health` khi có request đang chạy, test SIGTERM giữa request, thí nghiệm 2 instance không Redis, thí nghiệm kill/crash instance; chẩn đoán RAM host chỉ còn ~700MB → `wsl --shutdown`, tắt bớt app | Tự thấy `/health` chậm 2.7s và 3 request xếp hàng 9.2s (event loop bị chặn); in-flight request vẫn 200 sau SIGTERM, exit 0; history bị chia đôi khi không có Redis; `test_stateless.py` 5 câu qua 3 instance vẫn đủ 10 message; kill 1 instance → request vẫn 200 nhưng có 1 request chờ 60s (proxy_connect_timeout mặc định) |
 | 7 | CP5: hoàn thành các TODO của `06-lab-complete/` theo hợp đồng của `check_production_ready.py` | Claude đọc script chấm, viết `config.py`, `logging_config.py`, `auth.py`, `redis_client.py`, `rate_limiter.py` (Lua sliding window), `cost_guard.py` (Lua giữ chỗ budget ngày + tháng), `main.py`, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml` | Chạy `--static-only` (28/28) → `--skip-docker` (39/39) → bản đầy đủ **PASS 12/12, 43/43**; tự test thêm bằng `docker compose`: 401/200/429/422, Redis chết → `/ready` 503 còn `/health` 200, log không chứa API key, `docker stop` exit 0. **Cần tự đọc lại và giải thích được từng file trong `app/`** (Lab Coach có thể hỏi) |
+| 8 | CP6: deploy Render, viết `DEPLOYMENT.md`, so sánh `railway.toml` với `render.yaml`, đọc pipeline Cloud Run | Claude kiểm tra tài liệu Render (đường dẫn tương đối theo `rootDir`, Blueprint Path, `keyvalue`, `generateValue`), hướng dẫn tạo Blueprint, soạn `DEPLOYMENT.md` và bảng so sánh | Tự tạo Blueprint trên Render và lấy key; Claude gọi URL public: `/health` 200, `/ready` 200 (`redis: ok`), `/ask` không key và sai key 401; `check_production_ready.py --public-url` → ✅. Lệnh có key tự chạy (không đưa key cho AI) |
